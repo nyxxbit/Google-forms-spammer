@@ -1,6 +1,6 @@
 # Cortex Tools - Google Forms Spammer
 
-![Screenshot of the script running](https://prnt.sc/qfsWV24dB3wC)
+![Screenshot of the script running](https://i.imgur.com/vrGevgr.png)
 
 A high-performance automation script developed in Python to submit responses to one or multiple Google Forms massively and concurrently. The tool features a rich command-line interface (CLI) built with the `rich` library that displays real-time progress.
 
