@@ -21,11 +21,9 @@ console = Console()
 class ConsoleColor:
     HEADER, OKGREEN, FAIL, WARNING, OKBLUE = 'bold cyan', 'bold green', 'bold red', 'yellow', 'bold blue'
 
-# --- Variáveis Globais ---
 log_lock = threading.Lock()
 live_logs = deque(maxlen=10)
 
-# --- Classe para Gerenciar Cada Alvo ---
 class Target:
     def __init__(self, url, target_id):
         self.id = target_id
@@ -68,8 +66,7 @@ class Target:
             self.status = f"Erro na Análise: {e}"
             return False
 
-# --- LÓGICA DE PROXIES ---
-PROXY_SOURCES = ["https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"]
+PROXY_SOURCES = ["https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"]
 TEST_URL, PROXY_TIMEOUT = 'https://www.google.com', 7
 
 def test_proxy_worker(q, good_proxies_list, progress, task_id):
@@ -104,7 +101,6 @@ def setup_proxy_test():
     for t in threads: t.start()
     return progress_proxies, q, good_proxies
 
-# --- LÓGICA DO FORMULÁRIO ---
 def get_random_string(length=10): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 def generate_random_answers(questions_by_page):
@@ -202,7 +198,6 @@ def do_request(target, delay, proxy_list):
         with target.lock: target.failed_requests += 1
         with log_lock: live_logs.append(f"[red][Alvo {target.id}] T{thread_id}: Falhou - {e}[/red]")
 
-# --- Interface ---
 def make_layout():
     layout = Layout(name="root")
     layout.split(Layout(name="header", size=8), Layout(name="main", ratio=1))
@@ -225,7 +220,6 @@ def get_user_input():
     concurrent_threads = int(console.input(f"  [{ConsoleColor.OKBLUE}]Quantos envios simultâneos (threads TOTAIS)?:[/] "))
     return urls, use_proxies, delay, desired_successes, concurrent_threads
 
-# --- LÓGICA PRINCIPAL COM RENDERIZAÇÃO CENTRALIZADA ---
 def main():
     while True:
         live_logs.clear()
@@ -258,10 +252,8 @@ def main():
             layout["content"].update(Panel(progress, title="[bold yellow]Progresso do Envio[/]", border_style="yellow"))
 
             threads = []
-            # --- INÍCIO DA MODIFICAÇÃO ---
             while any(not t.is_complete(desired_successes) for t in active_targets):
                 for target in active_targets:
-                    # Atualiza o status do alvo se necessário
                     if target.is_complete(desired_successes):
                         if not target.status.startswith("Erro"):
                             target.status = "Concluído"
@@ -279,7 +271,6 @@ def main():
                         threads.append(t)
                         t.start()
 
-                # Atualiza a UI
                 for target in active_targets:
                     progress.update(target.progress_task_id, completed=target.successful_requests, f=target.failed_requests)
                 
@@ -298,14 +289,11 @@ def main():
                 
                 threads = [t for t in threads if t.is_alive()]
                 time.sleep(0.1)
-            # --- FIM DA MODIFICAÇÃO ---
-            
-            # Garante que o status final "Concluído" seja exibido
+                
             for target in active_targets:
                 if target.is_complete(desired_successes) and not target.status.startswith("Erro"):
                     target.status = "Concluído"
             
-            # Última atualização da UI para refletir o estado final de tudo
             side_panel_text = Text()
             for target in targets:
                 status_color = "green" if target.status == "Concluído" else "yellow" if target.status == "Enviando..." else "red" if "Erro" in target.status else "default"
