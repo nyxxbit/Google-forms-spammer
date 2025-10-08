@@ -1,0 +1,257 @@
+import threading
+import time
+import requests
+from bs4 import BeautifulSoup
+import random
+import string
+import json
+from queue import Queue
+import os
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+from rich.text import Text
+from rich.layout import Layout
+from rich.live import Live
+import pyfiglet
+
+class ConsoleColor:
+    HEADER = 'bold cyan'
+    OKGREEN = 'bold green'
+    FAIL = 'bold red'
+    WARNING = 'yellow'
+    OKBLUE = 'bold blue'
+
+successful_requests = 0
+failed_requests = 0
+log_lock = threading.Lock()
+first_failure_log = None
+
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"
+]
+TEST_URL = 'https://www.google.com'
+PROXY_TIMEOUT = 7
+
+def test_proxy_worker(q, good_proxies_list, progress, task_id):
+    while not q.empty():
+        proxy = q.get()
+        try:
+            proxy_dict = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+            requests.get(TEST_URL, proxies=proxy_dict, timeout=PROXY_TIMEOUT)
+            with log_lock:
+                good_proxies_list.append(proxy)
+                progress.update(task_id, description=f"[green]{len(good_proxies_list)} aprovados[/green]")
+        except Exception:
+            pass
+        finally:
+            progress.update(task_id, advance=1)
+            q.task_done()
+
+def get_and_test_proxies(console, layout):
+    raw_proxies = set()
+    with console.status("[bold green]Baixando listas de proxies...", spinner="earth"):
+        for url in PROXY_SOURCES:
+            try:
+                response = requests.get(url, timeout=10)
+                proxies_from_source = {p.strip() for p in response.text.strip().split('\n') if p.strip()}
+                raw_proxies.update(proxies_from_source)
+            except Exception:
+                pass
+    if not raw_proxies: return None
+    
+    q = Queue(); [q.put(p) for p in raw_proxies]
+    total_proxies = len(raw_proxies)
+    good_proxies = []
+
+    progress_proxies = Progress(
+        SpinnerColumn(), TextColumn("[bold blue]Testando {task.total} proxies..."), BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%", "•", TextColumn("{task.description}"), TimeRemainingColumn(),
+        console=console, transient=True
+    )
+    
+    with progress_proxies:
+        task_id = progress_proxies.add_task(description="[green]0 aprovados[/green]", total=total_proxies)
+        layout["body"].update(Panel(progress_proxies, title="[bold yellow]Teste de Proxy[/]", border_style="yellow"))
+        
+        threads = [threading.Thread(target=test_proxy_worker, args=(q, good_proxies, progress_proxies, task_id)) for _ in range(min(200, total_proxies))]
+        for t in threads: t.start()
+        q.join()
+
+    return good_proxies
+
+def get_random_string(length=10):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+def generate_random_answers(questions):
+    answers = {}
+    for q in questions:
+        q_id, q_type, options = q.get('id'), q.get('type'), q.get('options')
+        if not q_id: continue
+        if "texto" in q_type: answers[q_id] = get_random_string()
+        elif q_type in ["multipla_escolha", "lista_suspensa", "escala_linear", "classificacao"]:
+            if options: answers[q_id] = random.choice(options)
+        elif q_type == "caixas_selecao":
+            if options: answers[q_id] = random.sample(options, k=random.randint(1, len(options)))
+        elif q_type == "data":
+            answers[f"{q_id}_year"], answers[f"{q_id}_month"], answers[f"{q_id}_day"] = str(random.randint(2000, 2024)), str(random.randint(1, 12)), str(random.randint(1, 28))
+        elif q_type == "hora":
+            answers[f"{q_id}_hour"], answers[f"{q_id}_minute"] = str(random.randint(0, 23)), str(random.randint(0, 59))
+        elif q_type == "grade_multipla_escolha":
+            for row_id, row_options in options.items():
+                if row_options: answers[row_id] = random.choice(row_options)
+        elif q_type == "grade_caixa_selecao":
+            for row_id, row_options in options.items():
+                 if row_options:
+                    if (num_to_select := random.randint(0, len(row_options))) > 0:
+                        answers[row_id] = random.sample(row_options, num_to_select)
+    return answers
+
+def scrape_form_structure(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    questions = []
+    script_tag = soup.find('script', string=lambda t: t and 'FB_PUBLIC_LOAD_DATA_' in t)
+    if not script_tag: return []
+    json_str = script_tag.string.replace('var FB_PUBLIC_LOAD_DATA_ = ', '').rstrip(';')
+    data = json.loads(json_str)
+    question_list = data[1][1]
+    for q_data in question_list:
+        try:
+            question_info, q_id_data = {}, q_data[4][0]
+            question_info['id'] = f"entry.{q_id_data[0]}"
+            q_type_code = q_data[3]
+            question_info['options'] = [opt[0] for opt in q_id_data[1] if opt[0]] if q_id_data[1] else []
+            if q_type_code in [0, 1]: question_info['type'] = "texto"
+            elif q_type_code in [2, 3, 5, 18]: question_info['type'] = "multipla_escolha"
+            elif q_type_code == 4: question_info['type'] = "caixas_selecao"
+            elif q_type_code == 9: question_info['type'] = "data"
+            elif q_type_code == 10: question_info['type'] = "hora"
+            elif q_type_code == 7:
+                is_checkbox_grid = len(q_id_data) > 7 and q_id_data[7]
+                question_info['type'] = "grade_caixa_selecao" if is_checkbox_grid else "grade_multipla_escolha"
+                question_info['options'] = {f"entry.{r[0]}": [c[0] for c in r[1] if c[0]] for r in q_data[4]}
+            else: continue
+            questions.append(question_info)
+        except (TypeError, IndexError): continue
+    return questions
+
+def do_request(session, post_url, data_template, delay, proxy_list):
+    global successful_requests, failed_requests, first_failure_log
+    try:
+        if delay > 0: time.sleep(delay)
+        proxy_dict = {'http': f'http://{p}', 'https': f'http://{p}'} if proxy_list and (p := random.choice(proxy_list)) else None
+        random_payload = generate_random_answers(data_template)
+        random_payload['submissionTimestamp'] = int(time.time() * 1000)
+        response = session.post(post_url, data=random_payload, proxies=proxy_dict, timeout=10)
+        if "Sua resposta foi registrada" in response.text or "Your response has been recorded" in response.text:
+            with log_lock: successful_requests += 1
+        else:
+            with log_lock:
+                failed_requests += 1
+                if not first_failure_log: first_failure_log = (response.status_code, response.text[:500] + "...")
+    except requests.exceptions.RequestException:
+        with log_lock: failed_requests += 1
+
+def make_layout():
+    layout = Layout(name="root")
+    layout.split(Layout(name="header", size=8), Layout(ratio=1, name="main"), Layout(size=3, name="footer"))
+    layout["main"].split_row(Layout(name="side", minimum_size=40), Layout(name="body", ratio=2))
+    return layout
+
+def get_user_input(console):
+    console.print(Panel(f"[{ConsoleColor.HEADER}]Por favor, insira as informações abaixo[/]", border_style="cyan"))
+    user_url = console.input(f"  [{ConsoleColor.OKBLUE}]URL do Google Form:[/] ")
+    use_proxies = console.input(f"  [{ConsoleColor.OKBLUE}]Deseja usar proxies? (s/n):[/] ").lower() == 's'
+    delay = float(console.input(f"  [{ConsoleColor.OKBLUE}]Delay entre envios (ex: 0.1):[/] "))
+    desired_successes = int(console.input(f"  [{ConsoleColor.OKBLUE}]Quantos envios BEM-SUCEDIDOS você quer?:[/] "))
+    concurrent_threads = int(console.input(f"  [{ConsoleColor.OKBLUE}]Quantos envios simultâneos (threads)?:[/] "))
+    return user_url, use_proxies, delay, desired_successes, concurrent_threads
+
+def main():
+    global successful_requests, failed_requests, first_failure_log
+    console = Console()
+    
+    while True:
+        successful_requests = 0; failed_requests = 0; first_failure_log = None
+        os.system('cls' if os.name == 'nt' else 'clear')
+        layout = make_layout()
+        banner = pyfiglet.figlet_format("Cortex Tools", font="slant")
+        layout["header"].update(Panel(Text(banner, justify="center", style="bold cyan"), border_style="blue", title="[bold white]Google Forms Spammer[/]", subtitle="[cyan]v5.0[/]"))
+        layout["side"].update(Panel("Aguardando input...", title="[bold yellow]Configuração[/]"))
+        layout["body"].update(Panel("Aguardando...", title="[bold yellow]Status[/]"))
+        layout["footer"].update(Text("Pressione Ctrl+C para sair a qualquer momento", justify="center", style="dim"))
+
+        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
+            live.stop()
+            user_url, use_proxies, delay, desired_successes, concurrent_threads = get_user_input(console)
+            live.start()
+
+            side_panel_text = Text(f"Alvo: {user_url[:50]}...\n")
+            side_panel_text.append(f"Sucessos Desejados: {desired_successes}\n")
+            side_panel_text.append(f"Threads: {concurrent_threads}\n")
+            side_panel_text.append(f"Delay: {delay}s\n")
+            layout["side"].update(Panel(side_panel_text, title="[bold yellow]Configuração[/]", border_style="yellow"))
+            
+            proxy_list = get_and_test_proxies(console, layout) if use_proxies else None
+            if use_proxies and not proxy_list:
+                layout["footer"].update(Text("Nenhum proxy funcional. Usando seu IP.", style="bold red")); time.sleep(2)
+
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"})
+            
+            try:
+                layout["footer"].update(Text("Analisando estrutura do formulário...", style="yellow"))
+                response = session.get(user_url, allow_redirects=True, timeout=10)
+                view_url = response.url
+                if "/viewform" not in view_url: raise ValueError("Link inválido")
+                form_questions = scrape_form_structure(response.text)
+                if not form_questions: raise ValueError("Não foi possível analisar o formulário")
+                side_panel_text.append(f"Perguntas: {len(form_questions)}\n")
+                side_panel_text.append(f"Proxies: {'Sim' if proxy_list else 'Não'}")
+                layout["side"].update(Panel(side_panel_text, title="[bold yellow]Configuração[/]", border_style="yellow"))
+            except Exception as e:
+                layout["body"].update(Text(f"Erro: {e}", style="bold red")); time.sleep(5); continue
+            
+            post_url = view_url.replace("/viewform", "/formResponse")
+            session.headers.update({"Referer": view_url})
+            soup = BeautifulSoup(response.text, 'html.parser')
+            if fbzx := soup.find('input', {'name': 'fbzx'}):
+                fbzx_val = fbzx['value']
+                session.params.update({'fbzx': fbzx_val, 'pageHistory': '0', 'fvv': '1', 'draftResponse': f'[null,null,"{fbzx_val}"]'})
+            
+            with Progress(
+                TextColumn("[bold blue]{task.description}"), BarColumn(bar_width=None), "[progress.percentage]{task.percentage:>3.1f}%", "•",
+                TextColumn("[green]Sucesso: {task.completed}/{task.total}"), "•", TextColumn("[red]Falhas: {task.fields[f]}"), "•", TimeRemainingColumn(),
+                transient=True
+            ) as progress:
+                task = progress.add_task("Enviando...", total=desired_successes, f=0)
+                layout["body"].update(Panel(progress, title="[bold yellow]Progresso do Envio[/]", border_style="yellow"))
+                
+                threads = []
+                while successful_requests < desired_successes:
+                    if len(threads) < concurrent_threads:
+                        t = threading.Thread(target=do_request, args=(session, post_url, form_questions, delay, proxy_list))
+                        threads.append(t)
+                        t.start()
+                    
+                    threads = [t for t in threads if t.is_alive()]
+                    
+                    with log_lock:
+                        progress.update(task, completed=successful_requests, f=failed_requests)
+                    time.sleep(0.05)
+                
+                for t in threads:
+                    t.join()
+                progress.update(task, completed=successful_requests, f=failed_requests)
+
+            layout["footer"].update(Text("Processo Concluído!", style="bold green", justify="center"))
+            time.sleep(1)
+        
+        if console.input(f"\n[{ConsoleColor.HEADER}]Deseja rodar novamente? (s/n):[/] ").lower() != 's': break
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nSaindo...")
