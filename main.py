@@ -41,6 +41,7 @@ class Target:
         self.status = "Aguardando Análise"
         self.progress_task_id = None
         self.lock = threading.Lock()
+        self.custom_answers = {} # NOVO: Dicionário para respostas customizadas
 
     def is_complete(self, desired_successes):
         return self.successful_requests >= desired_successes or self.status.startswith("Erro")
@@ -103,12 +104,20 @@ def setup_proxy_test(good_proxy_logs, bad_proxy_logs, total_bad_proxies):
 
 def get_random_string(length=10): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-def generate_random_answers(questions_by_page):
+# --- MODIFICADO: Lógica híbrida para respostas ---
+def generate_answers(questions_by_page, custom_answers={}):
     page_answers = []
     for page in questions_by_page:
         answers = {}
         for q in page:
-            q_id, q_type, options = q.get('id'), q.get('type'), q.get('options')
+            q_id, q_type, options, title = q.get('id'), q.get('type'), q.get('options'), q.get('title')
+            
+            # Checa se existe uma resposta customizada para esta pergunta
+            if q_id in custom_answers:
+                answers[q_id] = custom_answers[q_id]
+                continue
+
+            # Se não, gera uma resposta aleatória como antes
             if not q_id: continue
             if "texto" in q_type: answers[q_id] = get_random_string()
             elif q_type in ["multipla_escolha", "lista_suspensa", "escala_linear", "classificacao"]:
@@ -173,10 +182,14 @@ def do_request(target, delay, proxy_list):
         thread_id = threading.get_ident() % 1000
         if delay > 0: time.sleep(delay)
         proxy_dict = {'http': f'http://{p}', 'https': f'http://{p}'} if proxy_list and (p := random.choice(proxy_list)) else None
-        all_random_answers, accumulated_answers, current_fbzx = generate_random_answers(target.questions_by_page), {}, target.initial_fbzx
-        for page_index, page_answers in enumerate(all_random_answers):
+        
+        # MODIFICADO: Usa a nova função híbrida
+        all_answers = generate_answers(target.questions_by_page, target.custom_answers)
+        accumulated_answers, current_fbzx = {}, target.initial_fbzx
+        
+        for page_index, page_answers in enumerate(all_answers):
             accumulated_answers.update(page_answers)
-            is_last_page = (page_index == len(all_random_answers) - 1)
+            is_last_page = (page_index == len(all_answers) - 1)
             payload = {**accumulated_answers, "fvv": "1", "pageHistory": ",".join(map(str, range(page_index + 1))), "submissionTimestamp": int(time.time() * 1000)}
             if current_fbzx: payload['fbzx'], payload['draftResponse'] = current_fbzx, f'[null,null,"{current_fbzx}"]'
             if not is_last_page: payload['continue'] = '1'
@@ -202,6 +215,46 @@ def make_layout():
     layout["body"].split_row(Layout(name="side", minimum_size=45), Layout(name="content", ratio=2))
     return layout
 
+# --- NOVO: Função para obter respostas customizadas ---
+def get_custom_answers(target):
+    console.print(Panel(f"Respostas Customizadas para o Alvo #{target.id}: {target.url[:60]}...", border_style="magenta"))
+    if console.input(f"  [{ConsoleColor.OKBLUE}]Deseja definir respostas fixas para este formulário? (s/n):[/] ").lower() != 's':
+        return
+
+    for i, page in enumerate(target.questions_by_page):
+        console.print(f"\n--- Página {i+1} ---")
+        for q in page:
+            console.print(Panel(f"[yellow]Pergunta:[/] {q['title']}"))
+            q_id, q_type, options = q.get('id'), q.get('type'), q.get('options')
+            
+            if q_type == "texto":
+                answer = console.input("  [cyan]Resposta (deixe em branco para aleatório):[/] ")
+                if answer: target.custom_answers[q_id] = answer
+
+            elif q_type in ["multipla_escolha", "lista_suspensa"]:
+                for idx, opt in enumerate(options): console.print(f"    [dim][{idx+1}][/dim] {opt}")
+                choice = console.input("  [cyan]Escolha uma opção pelo número (deixe em branco para aleatório):[/] ")
+                try:
+                    if choice and 0 < int(choice) <= len(options):
+                        target.custom_answers[q_id] = options[int(choice)-1]
+                except ValueError:
+                    console.print("[red]Entrada inválida. A pergunta será aleatória.[/red]")
+
+            elif q_type == "caixas_selecao":
+                for idx, opt in enumerate(options): console.print(f"    [dim][{idx+1}][/dim] {opt}")
+                choices_str = console.input("  [cyan]Escolha as opções (números separados por vírgula, ex: 1,3):[/] ")
+                if choices_str:
+                    try:
+                        selected_options = []
+                        indices = [int(i.strip()) for i in choices_str.split(',')]
+                        for idx in indices:
+                            if 0 < idx <= len(options):
+                                selected_options.append(options[idx-1])
+                        if selected_options:
+                            target.custom_answers[q_id] = selected_options
+                    except ValueError:
+                        console.print("[red]Entrada inválida. A pergunta será aleatória.[/red]")
+
 def get_user_input():
     console.print(Panel(f"[{ConsoleColor.HEADER}]Por favor, insira as informações abaixo[/]", border_style="cyan"))
     urls = []
@@ -223,21 +276,30 @@ def main():
         os.system('cls' if os.name == 'nt' else 'clear')
         urls, use_proxies, delay, desired_successes, concurrent_threads = get_user_input()
         targets = [Target(url, i + 1) for i, url in enumerate(urls)]
+        
+        # --- MODIFICADO: Análise e input customizado ANTES do Live display ---
+        active_targets = []
+        for target in targets:
+            console.print(f"\n[yellow]Analisando Alvo #{target.id}: {target.url[:50]}...[/yellow]")
+            if target.analyze():
+                active_targets.append(target)
+                get_custom_answers(target) # Pergunta por respostas customizadas
+            else:
+                console.print(f"[red]Falha ao analisar Alvo #{target.id}. Status: {target.status}[/red]")
+        
+        if not active_targets:
+            console.print("[bold red]\nNenhum alvo válido para processar. Reiniciando...[/bold red]")
+            time.sleep(3)
+            continue
+            
         layout = make_layout()
         banner = pyfiglet.figlet_format("Cortex Tools", font="slant")
-        layout["header"].update(Panel(Text(banner, justify="center", style="bold cyan"), border_style="blue", title="[bold white]Google Forms Spammer[/]", subtitle="[cyan]v9.3 - Total Counts[/]"))
+        layout["header"].update(Panel(Text(banner, justify="center", style="bold cyan"), border_style="blue", title="[bold white]Google Forms Spammer[/]", subtitle="[cyan]v10.0 - Custom Answers[/]"))
         
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
-            side_panel_text = Text(f"Alvo(s): {len(targets)}\n", no_wrap=True)
-            side_panel_text.append(f"Sucessos Desejados: {desired_successes}\n")
-            side_panel_text.append(f"Threads: {concurrent_threads}\n")
-            side_panel_text.append(f"Delay: {delay}s\n")
-            side_panel_text.append(f"Usar Proxies: {'Sim' if use_proxies else 'Não'}\n")
-            
             proxy_list = []
             if use_proxies:
-                good_proxy_logs = [] 
-                bad_proxy_logs = deque(maxlen=10)
+                good_proxy_logs, bad_proxy_logs = [], deque(maxlen=10)
                 total_bad_proxies = [0]
                 progress_proxies, q, _ = setup_proxy_test(good_proxy_logs, bad_proxy_logs, total_bad_proxies)
                 if progress_proxies:
@@ -253,14 +315,6 @@ def main():
                     layout["footer"].update(Panel(Text("Nenhum proxy funcional. Usando seu IP.", justify="center", style="bold red")))
                     time.sleep(2)
 
-            layout["side"].update(Panel(side_panel_text, title="[bold yellow]Configuração[/]", border_style="yellow"))
-
-            active_targets = []
-            for target in targets:
-                live.console.log(f"Analisando Alvo #{target.id}: {target.url[:50]}...")
-                target.analyze()
-                if not target.status.startswith("Erro"): active_targets.append(target)
-            
             progress = Progress(TextColumn("[bold blue]{task.description}"), BarColumn(bar_width=None), "[progress.percentage]{task.percentage:>3.1f}%", "•", TextColumn("[green]Sucesso: {task.completed}/{task.total}"), "•", TextColumn("[red]Falhas: {task.fields[f]}"))
             for target in active_targets:
                 target.progress_task_id = progress.add_task(f"[Alvo {target.id}] {target.url[:25]}...", total=desired_successes, f=0)
@@ -273,7 +327,6 @@ def main():
                         if not target.status.startswith("Erro"): target.status = "Concluído"
                     elif target.status == "Pronto para Envio": target.status = "Enviando..."
                     if target.is_complete(desired_successes): continue
-                    
                     threads_per_target = max(1, concurrent_threads // len(active_targets) if active_targets else 1)
                     current_target_threads = sum(1 for t in threads if t.is_alive() and getattr(t, 'target_id', None) == target.id)
                     if current_target_threads < threads_per_target:
@@ -282,38 +335,28 @@ def main():
 
                 for target in active_targets: progress.update(target.progress_task_id, completed=target.successful_requests, f=target.failed_requests)
                 
-                # --- INÍCIO DA MODIFICAÇÃO ---
                 side_panel_markup = ""
                 for target in targets:
                     status_color = "green" if target.status == "Concluído" else "yellow" if target.status == "Enviando..." else "red" if "Erro" in target.status else "default"
                     side_panel_markup += f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n"
                     side_panel_markup += f"  Status: [{status_color}]{target.status}[/{status_color}]\n"
-                    if not target.status.startswith("Erro"):
-                        side_panel_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
+                    if not target.status.startswith("Erro"): side_panel_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
                     side_panel_markup += "\n"
                 layout["side"].update(Panel(Text.from_markup(side_panel_markup), title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
                 
                 log_markup = "\n".join(live_logs)
                 layout["footer"].update(Panel(Text.from_markup(log_markup), title="[bold yellow]Logs em Tempo Real[/]", border_style="yellow"))
-                # --- FIM DA MODIFICAÇÃO ---
-                
                 threads = [t for t in threads if t.is_alive()]
                 time.sleep(0.1)
             
-            for target in active_targets:
-                if target.is_complete(desired_successes) and not target.status.startswith("Erro"): target.status = "Concluído"
-            
-            # --- INÍCIO DA MODIFICAÇÃO (FINAL) ---
             final_side_markup = ""
             for target in targets:
                 status_color = "green" if target.status == "Concluído" else "yellow" if target.status == "Enviando..." else "red" if "Erro" in target.status else "default"
                 final_side_markup += f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n"
                 final_side_markup += f"  Status: [{status_color}]{target.status}[/{status_color}]\n"
-                if not target.status.startswith("Erro"):
-                    final_side_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
+                if not target.status.startswith("Erro"): final_side_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
                 final_side_markup += "\n"
             layout["side"].update(Panel(Text.from_markup(final_side_markup), title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
-            # --- FIM DA MODIFICAÇÃO (FINAL) ---
 
             live.console.log("Processo Concluído!")
             time.sleep(2)
