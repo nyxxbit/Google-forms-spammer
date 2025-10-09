@@ -12,7 +12,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 from rich.text import Text
-from rich.columns import Columns
 from rich.layout import Layout
 from rich.live import Live
 import pyfiglet
@@ -41,7 +40,7 @@ class Target:
         self.status = "Aguardando Análise"
         self.progress_task_id = None
         self.lock = threading.Lock()
-        self.custom_answers = {} # NOVO: Dicionário para respostas customizadas
+        self.custom_answers = {}
 
     def is_complete(self, desired_successes):
         return self.successful_requests >= desired_successes or self.status.startswith("Erro")
@@ -104,7 +103,6 @@ def setup_proxy_test(good_proxy_logs, bad_proxy_logs, total_bad_proxies):
 
 def get_random_string(length=10): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-# --- MODIFICADO: Lógica híbrida para respostas ---
 def generate_answers(questions_by_page, custom_answers={}):
     page_answers = []
     for page in questions_by_page:
@@ -112,12 +110,10 @@ def generate_answers(questions_by_page, custom_answers={}):
         for q in page:
             q_id, q_type, options, title = q.get('id'), q.get('type'), q.get('options'), q.get('title')
             
-            # Checa se existe uma resposta customizada para esta pergunta
             if q_id in custom_answers:
                 answers[q_id] = custom_answers[q_id]
                 continue
 
-            # Se não, gera uma resposta aleatória como antes
             if not q_id: continue
             if "texto" in q_type: answers[q_id] = get_random_string()
             elif q_type in ["multipla_escolha", "lista_suspensa", "escala_linear", "classificacao"]:
@@ -183,7 +179,6 @@ def do_request(target, delay, proxy_list):
         if delay > 0: time.sleep(delay)
         proxy_dict = {'http': f'http://{p}', 'https': f'http://{p}'} if proxy_list and (p := random.choice(proxy_list)) else None
         
-        # MODIFICADO: Usa a nova função híbrida
         all_answers = generate_answers(target.questions_by_page, target.custom_answers)
         accumulated_answers, current_fbzx = {}, target.initial_fbzx
         
@@ -215,7 +210,6 @@ def make_layout():
     layout["body"].split_row(Layout(name="side", minimum_size=45), Layout(name="content", ratio=2))
     return layout
 
-# --- NOVO: Função para obter respostas customizadas ---
 def get_custom_answers(target):
     console.print(Panel(f"Respostas Customizadas para o Alvo #{target.id}: {target.url[:60]}...", border_style="magenta"))
     if console.input(f"  [{ConsoleColor.OKBLUE}]Deseja definir respostas fixas para este formulário? (s/n):[/] ").lower() != 's':
@@ -277,13 +271,12 @@ def main():
         urls, use_proxies, delay, desired_successes, concurrent_threads = get_user_input()
         targets = [Target(url, i + 1) for i, url in enumerate(urls)]
         
-        # --- MODIFICADO: Análise e input customizado ANTES do Live display ---
         active_targets = []
         for target in targets:
             console.print(f"\n[yellow]Analisando Alvo #{target.id}: {target.url[:50]}...[/yellow]")
             if target.analyze():
                 active_targets.append(target)
-                get_custom_answers(target) # Pergunta por respostas customizadas
+                get_custom_answers(target) 
             else:
                 console.print(f"[red]Falha ao analisar Alvo #{target.id}. Status: {target.status}[/red]")
         
