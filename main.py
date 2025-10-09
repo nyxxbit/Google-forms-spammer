@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 from rich.text import Text
+from rich.columns import Columns
 from rich.layout import Layout
 from rich.live import Live
 import pyfiglet
@@ -50,14 +51,11 @@ class Target:
             response = self.session.get(self.url, allow_redirects=True, timeout=15)
             self.view_url = response.url
             if "/viewform" not in self.view_url: raise ValueError("Link inválido")
-            
             self.questions_by_page, self.page_count = scrape_form_structure(response.text)
             if not any(self.questions_by_page): raise ValueError("Não encontrou perguntas")
-
             soup = BeautifulSoup(response.text, 'html.parser')
             self.initial_fbzx = soup.find('input', {'name': 'fbzx'})['value'] if soup.find('input', {'name': 'fbzx'}) else None
             if not self.initial_fbzx: raise ValueError("Não encontrou token fbzx")
-
             self.post_url = self.view_url.replace("/viewform", "/formResponse")
             self.session.headers.update({"Referer": self.view_url})
             self.status = "Pronto para Envio"
@@ -66,24 +64,27 @@ class Target:
             self.status = f"Erro na Análise: {e}"
             return False
 
-PROXY_SOURCES = ["https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"]
+PROXY_SOURCES = ["https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"]
 TEST_URL, PROXY_TIMEOUT = 'https://www.google.com', 7
 
-def test_proxy_worker(q, good_proxies_list, progress, task_id):
+def test_proxy_worker(q, good_proxy_list, bad_proxy_logs, total_bad_proxies, progress, task_id):
     while not q.empty():
         proxy = q.get()
         try:
             proxy_dict = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
             requests.get(TEST_URL, proxies=proxy_dict, timeout=PROXY_TIMEOUT)
             with log_lock:
-                good_proxies_list.append(proxy)
-                progress.update(task_id, description=f"[green]{len(good_proxies_list)} aprovados[/green]")
-        except Exception: pass
+                good_proxy_list.append(proxy)
+                progress.update(task_id, description=f"[green]{len(good_proxy_list)} aprovados[/green]")
+        except Exception:
+            with log_lock:
+                bad_proxy_logs.append(proxy)
+                total_bad_proxies[0] += 1
         finally:
             with log_lock: progress.update(task_id, advance=1)
             q.task_done()
 
-def setup_proxy_test():
+def setup_proxy_test(good_proxy_logs, bad_proxy_logs, total_bad_proxies):
     raw_proxies = set()
     with console.status("[bold green]Baixando listas de proxies...", spinner="earth"):
         for url in PROXY_SOURCES:
@@ -94,12 +95,11 @@ def setup_proxy_test():
             except Exception: pass
     if not raw_proxies: return None, None, None
     q = Queue(); [q.put(p) for p in raw_proxies]
-    good_proxies = []
     progress_proxies = Progress(SpinnerColumn(), TextColumn("[bold blue]Testando {task.total} proxies..."), BarColumn(), "[progress.percentage]{task.percentage:>3.0f}%", "•", TextColumn("{task.description}"), TimeRemainingColumn())
     task_id = progress_proxies.add_task(description="[green]0 aprovados[/green]", total=len(raw_proxies))
-    threads = [threading.Thread(target=test_proxy_worker, args=(q, good_proxies, progress_proxies, task_id)) for _ in range(min(200, len(raw_proxies)))]
+    threads = [threading.Thread(target=test_proxy_worker, args=(q, good_proxy_logs, bad_proxy_logs, total_bad_proxies, progress_proxies, task_id)) for _ in range(min(200, len(raw_proxies)))]
     for t in threads: t.start()
-    return progress_proxies, q, good_proxies
+    return progress_proxies, q, good_proxy_logs
 
 def get_random_string(length=10): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
@@ -125,8 +125,7 @@ def generate_random_answers(questions_by_page):
             elif q_type == "grade_caixa_selecao":
                 for row_id, row_options in options.items():
                     if row_options:
-                        if (num_to_select := random.randint(0, len(row_options))) > 0:
-                            answers[row_id] = random.sample(row_options, num_to_select)
+                        if (num_to_select := random.randint(0, len(row_options))) > 0: answers[row_id] = random.sample(row_options, num_to_select)
         page_answers.append(answers)
     return page_answers
 
@@ -146,8 +145,7 @@ def scrape_form_structure(html):
     for q_data in question_list:
         try:
             q_type_code = q_data[3]
-            if q_type_code == page_break_code:
-                current_page_index += 1; continue
+            if q_type_code == page_break_code: current_page_index += 1; continue
             if current_page_index >= page_count: continue
             question_info, q_id_data = {}, q_data[4][0]
             question_info['title'] = q_data[1] if q_data[1] else "Pergunta sem título"
@@ -180,8 +178,7 @@ def do_request(target, delay, proxy_list):
             accumulated_answers.update(page_answers)
             is_last_page = (page_index == len(all_random_answers) - 1)
             payload = {**accumulated_answers, "fvv": "1", "pageHistory": ",".join(map(str, range(page_index + 1))), "submissionTimestamp": int(time.time() * 1000)}
-            if current_fbzx:
-                payload['fbzx'], payload['draftResponse'] = current_fbzx, f'[null,null,"{current_fbzx}"]'
+            if current_fbzx: payload['fbzx'], payload['draftResponse'] = current_fbzx, f'[null,null,"{current_fbzx}"]'
             if not is_last_page: payload['continue'] = '1'
             response = target.session.post(target.post_url, data=payload, proxies=proxy_dict, timeout=15)
             if is_last_page:
@@ -228,23 +225,41 @@ def main():
         targets = [Target(url, i + 1) for i, url in enumerate(urls)]
         layout = make_layout()
         banner = pyfiglet.figlet_format("Cortex Tools", font="slant")
-        layout["header"].update(Panel(Text(banner, justify="center", style="bold cyan"), border_style="blue", title="[bold white]Google Forms Spammer[/]", subtitle="[cyan]v9.1 - Status Fix[/]"))
+        layout["header"].update(Panel(Text(banner, justify="center", style="bold cyan"), border_style="blue", title="[bold white]Google Forms Spammer[/]", subtitle="[cyan]v9.3 - Total Counts[/]"))
         
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
+            side_panel_text = Text(f"Alvo(s): {len(targets)}\n", no_wrap=True)
+            side_panel_text.append(f"Sucessos Desejados: {desired_successes}\n")
+            side_panel_text.append(f"Threads: {concurrent_threads}\n")
+            side_panel_text.append(f"Delay: {delay}s\n")
+            side_panel_text.append(f"Usar Proxies: {'Sim' if use_proxies else 'Não'}\n")
+            
             proxy_list = []
             if use_proxies:
-                progress_proxies, q, good_proxies = setup_proxy_test()
+                good_proxy_logs = [] 
+                bad_proxy_logs = deque(maxlen=10)
+                total_bad_proxies = [0]
+                progress_proxies, q, _ = setup_proxy_test(good_proxy_logs, bad_proxy_logs, total_bad_proxies)
                 if progress_proxies:
                     layout["content"].update(Panel(progress_proxies, title="[bold yellow]Teste de Proxy[/]", border_style="yellow"))
-                    while q.unfinished_tasks > 0: time.sleep(0.1)
-                    proxy_list = good_proxies
-            
+                    while q.unfinished_tasks > 0:
+                        good_text = Text("\n".join(good_proxy_logs[-10:]))
+                        bad_text = Text("\n".join(bad_proxy_logs))
+                        layout["side"].update(Panel(good_text, title=f"[green]Aprovados ({len(good_proxy_logs)})[/green]", border_style="green"))
+                        layout["footer"].update(Panel(bad_text, title=f"[red]Reprovados ({total_bad_proxies[0]})[/red]", border_style="red"))
+                        time.sleep(0.1)
+                    proxy_list = good_proxy_logs
+                if not proxy_list:
+                    layout["footer"].update(Panel(Text("Nenhum proxy funcional. Usando seu IP.", justify="center", style="bold red")))
+                    time.sleep(2)
+
+            layout["side"].update(Panel(side_panel_text, title="[bold yellow]Configuração[/]", border_style="yellow"))
+
             active_targets = []
             for target in targets:
                 live.console.log(f"Analisando Alvo #{target.id}: {target.url[:50]}...")
                 target.analyze()
-                if not target.status.startswith("Erro"):
-                    active_targets.append(target)
+                if not target.status.startswith("Erro"): active_targets.append(target)
             
             progress = Progress(TextColumn("[bold blue]{task.description}"), BarColumn(bar_width=None), "[progress.percentage]{task.percentage:>3.1f}%", "•", TextColumn("[green]Sucesso: {task.completed}/{task.total}"), "•", TextColumn("[red]Falhas: {task.fields[f]}"))
             for target in active_targets:
@@ -255,55 +270,50 @@ def main():
             while any(not t.is_complete(desired_successes) for t in active_targets):
                 for target in active_targets:
                     if target.is_complete(desired_successes):
-                        if not target.status.startswith("Erro"):
-                            target.status = "Concluído"
-                    elif target.status == "Pronto para Envio":
-                         target.status = "Enviando..."
-                    
+                        if not target.status.startswith("Erro"): target.status = "Concluído"
+                    elif target.status == "Pronto para Envio": target.status = "Enviando..."
                     if target.is_complete(desired_successes): continue
                     
                     threads_per_target = max(1, concurrent_threads // len(active_targets) if active_targets else 1)
                     current_target_threads = sum(1 for t in threads if t.is_alive() and getattr(t, 'target_id', None) == target.id)
-
                     if current_target_threads < threads_per_target:
                         t = threading.Thread(target=do_request, args=(target, delay, proxy_list))
-                        setattr(t, 'target_id', target.id)
-                        threads.append(t)
-                        t.start()
+                        setattr(t, 'target_id', target.id); threads.append(t); t.start()
 
-                for target in active_targets:
-                    progress.update(target.progress_task_id, completed=target.successful_requests, f=target.failed_requests)
+                for target in active_targets: progress.update(target.progress_task_id, completed=target.successful_requests, f=target.failed_requests)
                 
-                side_panel_text = Text()
+                # --- INÍCIO DA MODIFICAÇÃO ---
+                side_panel_markup = ""
                 for target in targets:
                     status_color = "green" if target.status == "Concluído" else "yellow" if target.status == "Enviando..." else "red" if "Erro" in target.status else "default"
-                    side_panel_text.append(f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n")
-                    side_panel_text.append(f"  Status: [{status_color}]{target.status}[/{status_color}]\n")
+                    side_panel_markup += f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n"
+                    side_panel_markup += f"  Status: [{status_color}]{target.status}[/{status_color}]\n"
                     if not target.status.startswith("Erro"):
-                        side_panel_text.append(f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n")
-                    side_panel_text.append("\n")
-                layout["side"].update(Panel(side_panel_text, title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
+                        side_panel_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
+                    side_panel_markup += "\n"
+                layout["side"].update(Panel(Text.from_markup(side_panel_markup), title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
                 
-                log_text = Text("\n".join(live_logs), justify="left")
-                layout["footer"].update(Panel(log_text, title="[bold yellow]Logs em Tempo Real[/]", border_style="yellow"))
+                log_markup = "\n".join(live_logs)
+                layout["footer"].update(Panel(Text.from_markup(log_markup), title="[bold yellow]Logs em Tempo Real[/]", border_style="yellow"))
+                # --- FIM DA MODIFICAÇÃO ---
                 
                 threads = [t for t in threads if t.is_alive()]
                 time.sleep(0.1)
-                
-            for target in active_targets:
-                if target.is_complete(desired_successes) and not target.status.startswith("Erro"):
-                    target.status = "Concluído"
             
-            side_panel_text = Text()
+            for target in active_targets:
+                if target.is_complete(desired_successes) and not target.status.startswith("Erro"): target.status = "Concluído"
+            
+            # --- INÍCIO DA MODIFICAÇÃO (FINAL) ---
+            final_side_markup = ""
             for target in targets:
                 status_color = "green" if target.status == "Concluído" else "yellow" if target.status == "Enviando..." else "red" if "Erro" in target.status else "default"
-                side_panel_text.append(f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n")
-                side_panel_text.append(f"  Status: [{status_color}]{target.status}[/{status_color}]\n")
+                final_side_markup += f"[bold][Alvo {target.id}] {target.url[:35]}...[/bold]\n"
+                final_side_markup += f"  Status: [{status_color}]{target.status}[/{status_color}]\n"
                 if not target.status.startswith("Erro"):
-                    side_panel_text.append(f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n")
-                side_panel_text.append("\n")
-            layout["side"].update(Panel(side_panel_text, title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
-
+                    final_side_markup += f"  Sucesso: {target.successful_requests}/{desired_successes} | Falhas: {target.failed_requests}\n"
+                final_side_markup += "\n"
+            layout["side"].update(Panel(Text.from_markup(final_side_markup), title="[bold yellow]Status dos Alvos[/]", border_style="yellow"))
+            # --- FIM DA MODIFICAÇÃO (FINAL) ---
 
             live.console.log("Processo Concluído!")
             time.sleep(2)
